@@ -1,0 +1,279 @@
+Description: Creates EC2 instance, 2 IAM roles, one with creds stored in SSM
+
+Parameters:
+  SSHKeyName:
+    Description: SSH key name to use with EC2 hosts
+    Type: String
+  VPC:
+    Description: VPC ID to place resources in
+    Type: String
+  Subnet:
+    Description: Subnet ID to place ec2 instance in
+    Type: String
+  AMI:
+    Description: AMI ID to use for EC2 instance
+    Type: String
+    Default: ami-04b762b4289fba92b
+  InstanceType:
+    Description: Instance type to use for EC2 instance
+    Type: String
+    Default: t3.micro
+  SSHAllowCIDR:
+    Description: CIDR block to grant access to the bastion host
+    Type: String
+    Default: "0.0.0.0/0"
+
+Resources:
+
+  #############################################################
+  # EC2Profile - this is the role the EC2 instance assumes
+  # which only has access to SSM parameter store
+  #############################################################
+  EC2Profile:
+    Type: AWS::IAM::InstanceProfile
+    DependsOn: EC2Role
+    Properties:
+      InstanceProfileName: EC2Profile
+      Roles:
+        - EC2Role
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EC2Role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: "EC2Role"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - ssm:DescribeParameters
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: "*"
+
+
+  ############################################################
+  # ComponentProfile / Role - this is used by the application
+  # code and maps to a IAM key pair that is stored in SSM
+  ############################################################
+  ComponentUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub "${AWS::StackName}-Component"
+  ComponentAccessKey:
+    Type: AWS::IAM::AccessKey
+    DependsOn: ComponentUser
+    Properties:
+      Status: Active
+      UserName: !Sub "${AWS::StackName}-Component"
+  ComponentPolicy:
+    Type: AWS::IAM::Policy
+    DependsOn: ComponentUser
+    Properties:
+      Users:
+        - !Sub "${AWS::StackName}-Component"
+      PolicyName: "ComponentPolicy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - sqs:CreateQueue
+              - sqs:ListQueues
+              - sqs:Receive*
+              - sqs:Delete*
+              - sqs:Send*
+              - sqs:Get*
+            Resource: "*"
+
+  ComponentUserAccessKeyWriteSSM:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: WriteSSMFunc
+    Properties:
+      KmsKey: !Ref EnvironmentSSMKey
+      Name: !Sub "/config/${AWS::StackName}/component/aws/accesskey"
+      Value: !Ref ComponentAccessKey
+      ServiceToken: !GetAtt WriteSSMFunc.Arn
+
+  ComponentUserSecretKeyWriteSSM:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: WriteSSMFunc
+    Properties:
+      KmsKey: !Ref EnvironmentSSMKey
+      Name: !Sub "/config/${AWS::StackName}/component/aws/secretkey"
+      Value: !GetAtt ComponentAccessKey.SecretAccessKey
+      ServiceToken: !GetAtt WriteSSMFunc.Arn
+
+  ############################################################
+  # Demo EC2 instance
+  ############################################################
+
+  DemoInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AMI
+      KeyName: !Ref SSHKeyName
+      InstanceType: !Ref InstanceType
+      Monitoring: true
+      SourceDestCheck: false
+      IamInstanceProfile: !Ref EC2Profile
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet:
+            - !Ref SecurityGroup
+          SubnetId: !Ref Subnet
+      UserData:
+        "Fn::Base64": !Sub |
+          #!/bin/bash -xe
+          yum update -y
+          # set hostname
+          hostname="${AWS::StackName}-demohost"
+          hostname $hostname
+          echo $hostname > /etc/hostname
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for ec2 host
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHAllowCIDR
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  ############################################################
+  # SSM Key used for encrypting parameter store values
+  ############################################################
+
+  EnvironmentSSMKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: "Environment KMS Key for SSM Properties"
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: "environment-key-ssm"
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: "Allow"
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: Allow writes from lambda
+            Effect: "Allow"
+            Principal:
+              AWS:
+                - !GetAtt WriteSSMRole.Arn
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+          - Sid: Allow reads from EC2
+            Effect: "Allow"
+            Principal:
+              AWS:
+                - !GetAtt EC2Role.Arn
+            Action:
+              - "kms:Decrypt"
+              - "kms:DescribeKey"
+
+  #################################################################
+  # Lambda custom resource used to write SSM parameter store values
+  #################################################################
+
+  WriteSSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "WriteSSMRolePolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:CreateLogGroup'
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                  - 'ssm:PutParameter'
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/config/*"
+
+  WriteSSMFunc:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-WriteSSMFunc"
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 128
+      Runtime: python3.6
+      Role: !GetAtt WriteSSMRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import json, boto3, urllib.request
+          def handler(event, context):
+            #print("Event: %s" % str(event))
+            status = "FAILED"
+            try:
+              if event["RequestType"] != "Delete":
+                ssm = boto3.client("ssm")
+                name = event["ResourceProperties"]["Name"]
+                val = event["ResourceProperties"]["Value"]
+                kmsKey = event["ResourceProperties"]["KmsKey"]
+                ssm.put_parameter(Name=name, Value=val, Type="SecureString", KeyId=kmsKey, Overwrite=True)
+                print("Wrote ssm param: %s" % name)
+              status = "SUCCESS"
+            finally:
+              out = {
+                "Status": status,
+                "Reason": status,
+                "NoEcho": False,
+                "PhysicalResourceId": context.log_stream_name,
+                "StackId": event["StackId"],
+                "RequestId": event["RequestId"],
+                "LogicalResourceId": event["LogicalResourceId"]
+              }
+              data = json.dumps(out).encode("utf8")
+              headers = {
+                'content-type': '',
+                'content-length': str(len(data))
+              }
+              req = urllib.request.Request(event["ResponseURL"], data=data, headers=headers, method='PUT')
+              urllib.request.urlopen(req)
+            return "Finished with status: %s" % status
